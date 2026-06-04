@@ -140,8 +140,13 @@ OPTIONS:
   -v       Verbose output for debugging.
 
 ADVANCED OPTIONS:
-  -p       Do not share current working directory. By default wrap will share 
-           the current working directory as a write mount and cd into it 
+  -N NAME  Run inside the existing named network namespace NAME. The namespace
+           must already exist (e.g. created by netns-sandbox.sh). wrap enters it
+           via 'sudo ip netns exec NAME' and drops back to the current user
+           before launching. This keeps the namespace's network instead of
+           unsharing net, and implies network access (-n) so DNS and TLS work.
+  -p       Do not share current working directory. By default wrap will share
+           the current working directory as a write mount and cd into it
            before running the program. With this option, wrap will not share 
            the directory and leave the current directory untouched.
   -f       Force share current working directory. By default wrap will share
@@ -173,8 +178,9 @@ fi
 unshare_all=1
 share_cwd=1
 force_share_cwd=0
+netns=""
 
-while getopts "r:w:e:abcdfhmnpuv" opt; do
+while getopts "r:w:e:N:abcdfhmnpuv" opt; do
   case "$opt" in
 
   # bind / mount a path readonly in sandbox to the same path as host
@@ -274,6 +280,29 @@ while getopts "r:w:e:abcdfhmnpuv" opt; do
   # grant network access
   n)
     bwrap_opts+=(--share-net)
+    bwrap_opts+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+    bwrap_opts+=(--ro-bind /etc/ssl /etc/ssl)
+    bwrap_opts+=(--ro-bind /etc/static/ssl /etc/static/ssl)
+    ;;
+
+  # run inside an existing named network namespace (see netns-sandbox.sh).
+  # the namespace must already exist; wrap will enter it via
+  # `sudo ip netns exec NAME` before launching bwrap, dropping back to the
+  # current user. this keeps the namespace's network (instead of unsharing
+  # net) and implies network access (-n) so that DNS and TLS work.
+  N)
+    netns="$OPTARG"
+
+    # keep the netns' network instead of unsharing net. we still want the
+    # full default isolation (--unshare-all), so rather than enumerate every
+    # namespace by hand we just add --share-net: per bwrap(1) it "retains the
+    # network namespace, overriding an earlier --unshare-all". it is appended
+    # to bwrap_opts, which is re-expanded after --unshare-all below, so the
+    # ordering (--unshare-all ... --share-net) is correct.
+    bwrap_opts+=(--share-net)
+
+    # imply network access binds so resolv.conf / TLS work inside the netns.
+    # the kernel exposes /etc/netns/NAME/resolv.conf as /etc/resolv.conf here.
     bwrap_opts+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
     bwrap_opts+=(--ro-bind /etc/ssl /etc/ssl)
     bwrap_opts+=(--ro-bind /etc/static/ssl /etc/static/ssl)
@@ -392,7 +421,15 @@ for e in "${env_vars[@]}"; do
   fi
 done
 
-exec bwrap \
+# when running inside a named network namespace, enter it via
+# `sudo ip netns exec NAME` and drop back to the current user before bwrap.
+# otherwise the prefix is empty and bwrap runs directly as today.
+netns_prefix=()
+if [[ -n "$netns" ]]; then
+  netns_prefix=(sudo ip netns exec "$netns" sudo -u "$USER")
+fi
+
+exec "${netns_prefix[@]}" bwrap \
   --chdir "$bwrap_chdir" \
   --clearenv \
   --dev /dev \
